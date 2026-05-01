@@ -1633,18 +1633,14 @@ class App:
             "Powered by pyembroidery, Pillow, OpenCV, NumPy")
 
 
+
+
 def main():
     root = tk.Tk()
     root.title(f"{APP_NAME} -- {APP_SUB}")
+    icon_path = Path(__file__).parent / "ladybug.ico"
     try:
-        icon = Image.new("RGBA",(48,48),(0,0,0,0))
-        d    = ImageDraw.Draw(icon)
-        d.ellipse([2,2,46,46],  fill="#C0392B")
-        d.ellipse([2,2,24,46],  fill="#96281B")
-        d.ellipse([18,0,30,12], fill="#3D1A1A")
-        for dx,dy in [(-12,-6),(4,-12),(14,0),(-12,8),(5,10)]:
-            d.ellipse([24+dx-4,24+dy-4,24+dx+4,24+dy+4], fill="#3D1A1A")
-        root.iconphoto(True, ImageTk.PhotoImage(icon))
+        root.iconbitmap(str(icon_path))
     except Exception:
         pass
     App(root)
@@ -1653,3 +1649,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
