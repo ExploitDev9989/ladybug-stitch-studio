@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.spec
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temp / scratch files
+emb_part1.py
+emb_part2.py
+
+# App config (personal font folder paths etc.)
+# Remove the next line if you want to share settings too
+# ~/.ladybug_stitch/

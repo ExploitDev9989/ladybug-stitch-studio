@@ -1,0 +1,4 @@
+pyembroidery>=1.4.36
+Pillow>=9.0
+numpy>=1.21
+opencv-python>=4.5
