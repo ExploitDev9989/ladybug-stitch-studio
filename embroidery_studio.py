@@ -304,84 +304,231 @@ class BXGlyph:
 
 class BXFont:
     """
-    Embrilliance .bx font.
+    Embrilliance .bx font — multi-strategy loader.
 
-    A .bx file is a ZIP archive containing one embroidery file per glyph.
-    Supported filename conventions:
-      • Single letter:      A.pes  →  'A'
-      • Decimal ASCII:      065.pes → 'A'  (chr(65))
-      • Named alias:        space.pes → ' ',  period.pes → '.'
-      • Subfolder sizes:    1inch/A.pes  (we flatten and take any size found)
+    Loading strategies (tried in order):
+      1. BX001 binary  — scan the binary for embedded #PES blocks; try several
+                         heuristics to map each block to a character code.
+      2. ZIP archive   — some older/third-party .bx files are plain ZIPs.
+      3. Companion dir — look for a folder named exactly like the .bx file
+                         (minus extension) sitting next to it, containing
+                         individual embroidery files per glyph.
+      4. Companion PES — look for files like  FontName_A.pes / FontName065.pes
+                         in the same directory as the .bx file.
+
+    Filename → character conventions for strategies 3 & 4:
+      Single letter:   A.pes  →  'A'
+      Decimal ASCII:   065.pes → 'A'   (chr(65))
+      Named alias:     space.pes → ' ',  period.pes → '.'
+      Hex code:        41.pes (hex 41 = 'A')
     """
 
     def __init__(self, path):
-        self.path   = Path(path)
-        self.name   = self.path.stem
-        self.glyphs = {}    # char → BXGlyph  (lazy-loaded)
-        self._index = {}    # char → zip_member_path
-        self._ok    = False
+        self.path    = Path(path)
+        self.name    = self.path.stem
+        self.glyphs  = {}       # char → BXGlyph  (lazy-loaded)
+        # _index values are one of:
+        #   ('file', Path)           – companion/ZIP file path
+        #   ('bx001', int, int)      – (start_byte, end_byte) inside self.path
+        self._index  = {}
+        self._ok     = False
         self._scan()
 
-    # ── scanning ─────────────────────────────────────────────────────────
+    # ── top-level scan ────────────────────────────────────────────────────
 
     def _scan(self):
         try:
-            if not zipfile.is_zipfile(self.path):
-                return
-            with zipfile.ZipFile(self.path, "r") as zf:
-                for member in zf.namelist():
-                    p    = Path(member)
-                    ext  = p.suffix.lower()
-                    if ext not in _EMB_EXTS:
-                        continue
-                    stem  = p.stem          # original case
-                    stemL = stem.lower()
-
-                    # --- single character  A.pes, a.pes, 0.pes, ..., !.pes
-                    if len(stem) == 1:
-                        # Don't overwrite uppercase with lowercase variant
-                        if stem not in self._index:
-                            self._index[stem] = member
-                        continue
-
-                    # --- decimal ASCII code  065.pes  →  'A'
-                    if stemL.isdigit():
-                        code = int(stemL)
-                        if 32 <= code <= 126:
-                            ch = chr(code)
-                            if ch not in self._index:
-                                self._index[ch] = member
-                        continue
-
-                    # --- named alias  space.pes, period.pes, ...
-                    if stemL in _CHAR_NAMES:
-                        ch = _CHAR_NAMES[stemL]
-                        if ch not in self._index:
-                            self._index[ch] = member
-                        continue
-
-                    # --- hex code  41.pes (hex 41 = 'A') — less common
-                    try:
-                        code = int(stemL, 16)
-                        if 32 <= code <= 126:
-                            ch = chr(code)
-                            if ch not in self._index:
-                                self._index[ch] = member
-                    except ValueError:
-                        pass
-
-            self._ok = len(self._index) > 0
+            raw = self.path.read_bytes()
         except Exception as e:
-            print(f"BXFont scan error [{self.path.name}]: {e}")
+            print(f"BXFont: cannot read {self.path.name}: {e}")
+            return
+
+        # Strategy 1 – BX001 proprietary binary
+        if raw[:5] == b'BX001':
+            self._scan_bx001(raw)
+
+        # Strategy 2 – ZIP archive (older / third-party fonts)
+        if not self._ok:
+            try:
+                if zipfile.is_zipfile(self.path):
+                    self._scan_zip()
+            except Exception:
+                pass
+
+        # Strategy 3 – companion folder  (FontName/ next to FontName.bx)
+        if not self._ok:
+            companion_dir = self.path.parent / self.path.stem
+            if companion_dir.is_dir():
+                self._scan_folder(companion_dir)
+
+        # Strategy 4 – PES files in same dir prefixed with font name
+        if not self._ok:
+            self._scan_sibling_files()
+
+        if self._ok:
+            print(f"BXFont loaded: {self.path.name} — "
+                  f"{len(self._index)} chars via "
+                  f"{'bx001' if any(v[0]=='bx001' for v in self._index.values()) else 'files'}")
+        else:
+            print(f"BXFont: no glyphs found in {self.path.name}")
+
+    # ── Strategy 1: BX001 binary ──────────────────────────────────────────
+
+    def _scan_bx001(self, data):
+        """
+        Scan binary BX001 file for embedded #PES blocks and map them to chars.
+
+        The BX001 format stores each glyph as an embedded PES file.
+        Before each PES block the character code is encoded in one of several
+        ways depending on the Embrilliance version; we try them all.
+        """
+        import struct, re as _re
+
+        size = len(data)
+        # Collect all #PES start positions
+        pes_pos = [m.start() for m in _re.finditer(b'#PES', data)]
+        if not pes_pos:
+            return
+
+        # Build end-of-block map (each block runs to the next #PES start)
+        pes_ends = {}
+        for i, p in enumerate(pes_pos):
+            pes_ends[p] = pes_pos[i + 1] if i + 1 < len(pes_pos) else size
+
+        assigned = {}   # char → (start, end)
+
+        for p in pes_pos:
+            ch = None
+
+            # ── Try various pre-PES encodings ────────────────────────────
+            # Layout A:  [uint8 char_code] [uint32 length] [#PES ...]
+            if p >= 5:
+                b = data[p - 5]
+                if 32 <= b <= 126:
+                    ch = chr(b)
+
+            # Layout B:  [uint16-LE char_code] [uint32 length] [#PES ...]
+            if ch is None and p >= 6:
+                v = struct.unpack_from('<H', data, p - 6)[0]
+                if 32 <= v <= 126:
+                    ch = chr(v)
+
+            # Layout C:  [uint8 char_code] [#PES ...]  (no length prefix)
+            if ch is None and p >= 1:
+                b = data[p - 1]
+                if 32 <= b <= 126 and b not in (ord('#'), ord('P'), ord('E'), ord('S')):
+                    ch = chr(b)
+
+            # Layout D:  [uint16-LE char_code] [#PES ...]  (no length prefix)
+            if ch is None and p >= 2:
+                v = struct.unpack_from('<H', data, p - 2)[0]
+                if 32 <= v <= 126:
+                    ch = chr(v)
+
+            # Layout E: check 4–12 bytes before for a plausible ASCII char
+            if ch is None and p >= 4:
+                for look in range(4, min(13, p)):
+                    b = data[p - look]
+                    if 32 <= b <= 126 and b not in (ord('#'), ord('P'), ord('E'), ord('S')):
+                        ch = chr(b)
+                        break
+
+            if ch and ch not in assigned:
+                assigned[ch] = (p, pes_ends[p])
+
+        # ── Sequential fallback ───────────────────────────────────────────
+        # If we couldn't map chars via heuristics, assume glyphs are stored
+        # in sequential ASCII order starting from space (32) or 'A' (65).
+        if not assigned:
+            # Guess starting code: if ~26 blocks, start at 'A'; if ~95, at ' '
+            n = len(pes_pos)
+            start_code = 65 if n <= 30 else 32
+            for i, p in enumerate(pes_pos):
+                code = start_code + i
+                if 32 <= code <= 126:
+                    ch = chr(code)
+                    assigned[ch] = (p, pes_ends[p])
+
+        for ch, (start, end) in assigned.items():
+            self._index[ch] = ('bx001', start, end)
+
+        self._ok = len(self._index) > 0
+
+    # ── Strategy 2: ZIP archive ───────────────────────────────────────────
+
+    def _scan_zip(self):
+        with zipfile.ZipFile(self.path, "r") as zf:
+            for member in zf.namelist():
+                p    = Path(member)
+                ext  = p.suffix.lower()
+                if ext not in _EMB_EXTS:
+                    continue
+                ch = self._stem_to_char(p.stem)
+                if ch and ch not in self._index:
+                    self._index[ch] = ('zip', member)
+        self._ok = len(self._index) > 0
+
+    # ── Strategy 3 & 4: folder / sibling files ───────────────────────────
+
+    def _scan_folder(self, folder):
+        for f in folder.rglob("*"):
+            if f.suffix.lower() not in _EMB_EXTS:
+                continue
+            ch = self._stem_to_char(f.stem)
+            if ch and ch not in self._index:
+                self._index[ch] = ('file', f)
+        self._ok = len(self._index) > 0
+
+    def _scan_sibling_files(self):
+        prefix = self.path.stem.lower() + "_"
+        for f in self.path.parent.iterdir():
+            if f.suffix.lower() not in _EMB_EXTS:
+                continue
+            stem = f.stem
+            # Match  FontName_A.pes  or  FontName_065.pes
+            if stem.lower().startswith(prefix):
+                rest = stem[len(prefix):]
+            else:
+                rest = stem
+            ch = self._stem_to_char(rest)
+            if ch and ch not in self._index:
+                self._index[ch] = ('file', f)
+        self._ok = len(self._index) > 0
+
+    # ── char resolution helper ────────────────────────────────────────────
+
+    @staticmethod
+    def _stem_to_char(stem):
+        """Convert a filename stem to a single character, or None."""
+        stemL = stem.lower()
+        # single character
+        if len(stem) == 1:
+            return stem
+        # named alias
+        if stemL in _CHAR_NAMES:
+            return _CHAR_NAMES[stemL]
+        # decimal ASCII  065 → 'A'
+        if stemL.isdigit():
+            code = int(stemL)
+            if 32 <= code <= 126:
+                return chr(code)
+        # hex ASCII  41 → 'A'
+        try:
+            code = int(stemL, 16)
+            if 32 <= code <= 126:
+                return chr(code)
+        except ValueError:
+            pass
+        return None
 
     # ── properties ───────────────────────────────────────────────────────
 
     @property
-    def is_valid(self):      return self._ok
+    def is_valid(self):         return self._ok
     @property
-    def char_count(self):    return len(self._index)
+    def char_count(self):       return len(self._index)
     @property
-    def available_chars(self): return set(self._index.keys())
+    def available_chars(self):  return set(self._index.keys())
 
     def has_char(self, ch):
         return (ch in self._index or ch.lower() in self._index
@@ -394,25 +541,16 @@ class BXFont:
         if ch in self.glyphs:
             return self.glyphs[ch]
 
-        member = self._index.get(ch) or self._index.get(ch.lower()) \
-                 or self._index.get(ch.upper())
-        if member is None:
+        entry = (self._index.get(ch) or self._index.get(ch.lower())
+                 or self._index.get(ch.upper()))
+        if entry is None:
             return None
 
         try:
             if not HAS_PYEMBROIDERY:
                 return None
-            with zipfile.ZipFile(self.path, "r") as zf:
-                data = zf.read(member)
-            suffix = Path(member).suffix
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp.write(data)
-                tmp_path = tmp.name
-            try:
-                pat = pyembroidery.read(tmp_path)
-            finally:
-                try: os.unlink(tmp_path)
-                except: pass
+
+            pat = self._load_entry(entry)
             if pat is None:
                 return None
             design = EmbroideryDesign()
@@ -425,6 +563,40 @@ class BXFont:
         except Exception as e:
             print(f"Glyph load error [{ch}] in {self.path.name}: {e}")
             return None
+
+    def _load_entry(self, entry):
+        """Load a pyembroidery pattern from any entry type."""
+        kind = entry[0]
+
+        if kind == 'file':
+            _, fpath = entry
+            return pyembroidery.read(str(fpath))
+
+        if kind == 'zip':
+            _, member = entry
+            suffix = Path(member).suffix
+            with zipfile.ZipFile(self.path, "r") as zf:
+                raw = zf.read(member)
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(raw); tmp_path = tmp.name
+            try:
+                return pyembroidery.read(tmp_path)
+            finally:
+                try: os.unlink(tmp_path)
+                except: pass
+
+        if kind == 'bx001':
+            _, start, end = entry
+            raw = self.path.read_bytes()[start:end]
+            with tempfile.NamedTemporaryFile(suffix='.pes', delete=False) as tmp:
+                tmp.write(raw); tmp_path = tmp.name
+            try:
+                return pyembroidery.read(tmp_path)
+            finally:
+                try: os.unlink(tmp_path)
+                except: pass
+
+        return None
 
     # ── text rendering ────────────────────────────────────────────────────
 
@@ -487,6 +659,9 @@ class FontLibrary:
     """
     Manages all BX fonts in the user-specified folder.
     Results are cached; call scan() to refresh.
+
+    Also picks up "loose" font folders — subdirectories that contain
+    embroidery files per glyph but no .bx file.
     """
 
     def __init__(self, settings: AppSettings):
@@ -501,27 +676,88 @@ class FontLibrary:
         self.fonts.clear()
         folder = self.folder
         if not folder or not os.path.isdir(folder):
-            return
-        bx_files = list(Path(folder).rglob("*.bx"))
-        total = len(bx_files)
-        for i, f in enumerate(bx_files):
             if progress:
-                progress(int(100 * i / max(total, 1)),
-                         f"Loading {f.name} …")
+                progress(100, "No font folder set — choose one in Settings.")
+            return
+
+        root = Path(folder)
+
+        # ── collect candidate paths ──────────────────────────────────────
+        # 1. Every .bx file found anywhere under the font folder
+        bx_files = list(root.rglob("*.bx"))
+
+        # 2. Direct sub-folders that contain embroidery files but no .bx
+        loose_dirs = []
+        for d in root.iterdir():
+            if not d.is_dir():
+                continue
+            # Skip folders that already have a sibling .bx (handled above)
+            has_bx = any(d.parent.glob(d.name + ".bx"))
+            if has_bx:
+                continue
+            emb_files = [f for f in d.iterdir()
+                         if f.suffix.lower() in _EMB_EXTS]
+            if len(emb_files) >= 5:      # at least 5 glyphs → treat as font
+                loose_dirs.append(d)
+
+        total = len(bx_files) + len(loose_dirs)
+        if total == 0:
+            if progress:
+                progress(100, "No font files found in that folder.")
+            return
+
+        done = 0
+
+        # ── load .bx files ───────────────────────────────────────────────
+        for f in bx_files:
+            if progress:
+                progress(int(100 * done / total), f"Scanning {f.name} …")
             try:
                 font = BXFont(f)
                 if font.is_valid:
                     self.fonts[font.name] = font
+                    print(f"  ✓ {font.name}  ({font.char_count} glyphs)")
+                else:
+                    print(f"  ✗ {f.name}  (no glyphs found)")
             except Exception as e:
                 print(f"FontLibrary: skip {f.name} — {e}")
+            done += 1
+
+        # ── load loose folders ───────────────────────────────────────────
+        for d in loose_dirs:
+            if progress:
+                progress(int(100 * done / total), f"Scanning folder {d.name} …")
+            try:
+                font = _LooseFont(d)
+                if font.is_valid:
+                    self.fonts[font.name] = font
+                    print(f"  ✓ {font.name}  ({font.char_count} glyphs, loose folder)")
+            except Exception as e:
+                print(f"FontLibrary: skip folder {d.name} — {e}")
+            done += 1
+
         if progress:
-            progress(100, f"Loaded {len(self.fonts)} fonts.")
+            progress(100, f"Loaded {len(self.fonts)} font(s).")
 
     def names(self):
         return sorted(self.fonts.keys(), key=str.lower)
 
     def get(self, name):
         return self.fonts.get(name)
+
+
+class _LooseFont(BXFont):
+    """
+    Treat a plain folder full of embroidery files as a BX-style font.
+    Re-uses BXFont's glyph machinery; just skips the .bx binary scan.
+    """
+    def __init__(self, folder_path):
+        self.path    = Path(folder_path)
+        self.name    = self.path.name
+        self.glyphs  = {}
+        self._index  = {}
+        self._ok     = False
+        self._scan_folder(self.path)    # strategy 3 directly
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1436,127 +1672,175 @@ class App:
     def open_font_browser(self):
         if not self.library.fonts and not self.settings.get("font_folder"):
             if messagebox.askyesno("No font folder",
-                "No BX font folder has been configured.\nSet it now?"):
+                "No BX font folder has been set.\n\n"
+                "Would you like to set your font folder now?"):
                 self._open_settings()
             return
         if not self.library.fonts:
+            self.status_var.set("Scanning fonts…")
             self.library.scan()
         FontBrowserDialog(self.root, self.library, self.settings,
                           self._insert_text_design)
 
     def _insert_text_design(self, text_design):
+        """Merge text_design into the current design."""
         if not self.design.threads:
             self.design = text_design
         else:
-            b_e = self.design.get_bounds()
-            b_t = text_design.get_bounds()
-            off = b_e[3] - b_t[1] + 50
+            # Offset text below existing design
+            b_existing = self.design.get_bounds()
+            b_text     = text_design.get_bounds()
+            offset_y   = b_existing[3] - b_text[1] + 50  # 5 mm gap
             for th in text_design.threads:
-                nt = StitchThread(th.color, th.name)
-                for x,y,st in th.stitches: nt.stitches.append((x,y+off,st))
-                self.design.threads.append(nt)
+                new_th = StitchThread(th.color, th.name)
+                for x, y, st in th.stitches:
+                    new_th.stitches.append((x, y+offset_y, st))
+                self.design.threads.append(new_th)
+
         self.canvas.fit_design()
         self._refresh(); self._update_stats(); self._update_thread_panel()
-        self.status_var.set(f"Text added -- {self.design.stitch_count:,} stitches total")
+        self.root.title(f"{APP_NAME} — {APP_SUB}")
+        self.status_var.set(
+            f"Text added  ·  {self.design.stitch_count:,} stitches total ✨")
 
     def _reload_fonts(self):
-        self.status_var.set("Rescanning fonts...")
+        self.status_var.set("Rescanning font library…")
         threading.Thread(target=self._bg_scan_fonts, daemon=True).start()
 
     def _open_settings(self):
         SettingsDialog(self.root, self.settings, self._reload_fonts)
 
+    # ── file ops ──────────────────────────────────────────────────────────
+
     def new_design(self):
-        if messagebox.askyesno("New", "Clear current design?"):
+        if messagebox.askyesno("New design", "Clear current design?"):
             self.design = EmbroideryDesign()
             self._refresh(); self._update_stats(); self._update_thread_panel()
+            self.root.title(f"{APP_NAME} — {APP_SUB}")
 
     def open_file(self):
         if not HAS_PYEMBROIDERY:
-            messagebox.showerror("Missing", "pip install pyembroidery"); return
-        p = filedialog.askopenfilename(title="Open", filetypes=READ_FORMATS)
+            messagebox.showerror("Missing",
+                "pyembroidery not installed.\npip install pyembroidery"); return
+        p = filedialog.askopenfilename(title="Open embroidery file",
+                                       filetypes=READ_FORMATS)
         if not p: return
         try:
+            self.status_var.set("Loading …")
             self.design = FileIO.load(p)
             self.root.after(40, self._post_load)
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            messagebox.showerror("Open error", str(e))
 
     def _post_load(self):
         self.canvas.fit_design()
         self._refresh(); self._update_stats(); self._update_thread_panel()
-        self.root.title(f"{APP_NAME} -- {self.design.name}")
+        self.root.title(f"{APP_NAME} — {self.design.name}")
         self.status_var.set(
-            f"{self.design.name}  {self.design.stitch_count:,} stitches  "
-            f"{self.design.color_count} colours  "
-            f"{self.design.width_mm:.1f}x{self.design.height_mm:.1f}mm")
+            f"{self.design.name}  ·  {self.design.stitch_count:,} stitches  ·  "
+            f"{self.design.color_count} colours  ·  "
+            f"{self.design.width_mm:.1f}×{self.design.height_mm:.1f} mm")
 
     def save_file(self):
         if not self.design.filepath: self.save_as(); return
         try:
             FileIO.save(self.design, self.design.filepath)
             self.status_var.set(f"Saved: {self.design.filepath}")
-        except Exception as e: messagebox.showerror("Save error", str(e))
+        except Exception as e:
+            messagebox.showerror("Save error", str(e))
 
     def save_as(self):
         if not HAS_PYEMBROIDERY:
-            messagebox.showerror("Missing", "pip install pyembroidery"); return
-        p = filedialog.asksaveasfilename(title="Save As", defaultextension=".pes",
-            initialfile=(self.design.name or "design")+".pes", filetypes=WRITE_FORMATS)
+            messagebox.showerror("Missing",
+                "pyembroidery not installed.\npip install pyembroidery"); return
+        p = filedialog.asksaveasfilename(
+            title="Save / Export",
+            defaultextension=".pes",
+            initialfile=(self.design.name or "design")+".pes",
+            filetypes=WRITE_FORMATS)
         if p:
             try:
                 FileIO.save(self.design, p)
+                self.root.title(f"{APP_NAME} — {self.design.name}")
                 self.status_var.set(f"Saved: {p}")
-            except Exception as e: messagebox.showerror("Save error", str(e))
+            except Exception as e:
+                messagebox.showerror("Save error", str(e))
 
     def _quick_export(self, ext):
         if not HAS_PYEMBROIDERY:
-            messagebox.showerror("Missing", "pip install pyembroidery"); return
-        p = filedialog.asksaveasfilename(defaultextension=ext,
+            messagebox.showerror("Missing",
+                "pyembroidery not installed.\npip install pyembroidery"); return
+        p = filedialog.asksaveasfilename(
+            title=f"Export {ext.upper()}",
+            defaultextension=ext,
             initialfile=(self.design.name or "design")+ext)
         if p:
             try:
-                FileIO.save(self.design, p); self.status_var.set(f"Exported: {p}")
-            except Exception as e: messagebox.showerror("Export error", str(e))
+                FileIO.save(self.design, p)
+                self.status_var.set(f"Exported: {p}")
+            except Exception as e:
+                messagebox.showerror("Export error", str(e))
+
+    # ── digitizing ────────────────────────────────────────────────────────
 
     def _open_digitize(self):
         if not (HAS_CV2 and HAS_NUMPY):
-            messagebox.showerror("Missing", "pip install opencv-python numpy"); return
+            messagebox.showerror("Missing libraries",
+                "Digitizer needs OpenCV and NumPy.\n\npip install opencv-python numpy"); return
         DigitizeDialog(self.root, self._run_digitize)
 
     def _run_digitize(self, path, nc, sl, wm, hm):
-        pw = tk.Toplevel(self.root); pw.title("Digitizing...")
-        pw.geometry("380x140"); pw.resizable(False,False)
-        pw.configure(bg=LB_CREAM); pw.grab_set()
-        tk.Label(pw, text="Digitizing your image...",
-                 font=("Georgia",12,"bold"), bg=LB_CREAM, fg=LB_RED).pack(pady=12)
-        lbl = tk.Label(pw, text="Starting...", bg=LB_CREAM, wraplength=340); lbl.pack()
-        bar = ttk.Progressbar(pw, length=340, mode="determinate"); bar.pack(pady=8)
-        def cb(pct, msg): bar["value"]=pct; lbl.config(text=msg); pw.update()
+        pw = tk.Toplevel(self.root)
+        pw.title("Digitizing…")
+        pw.geometry("380x140")
+        pw.resizable(False,False)
+        pw.configure(bg=LB_CREAM)
+        pw.grab_set()
+        tk.Label(pw, text="🐞  Digitizing your image…",
+                 font=("Georgia",12,"bold"), bg=LB_CREAM, fg=LB_RED
+                 ).pack(pady=12)
+        lbl = tk.Label(pw, text="Starting…", bg=LB_CREAM, fg=LB_DARK,
+                       wraplength=340)
+        lbl.pack()
+        bar = ttk.Progressbar(pw, length=340, mode="determinate")
+        bar.pack(pady=8)
+
+        def cb(pct, msg):
+            bar["value"]=pct; lbl.config(text=msg); pw.update()
+
         def run():
             try:
                 d = Digitizer(nc,sl,wm,hm).digitize(path,cb)
                 self.root.after(0, lambda: self._dig_done(d,pw))
             except Exception as e:
                 self.root.after(0, lambda: self._dig_fail(str(e),pw))
+
         threading.Thread(target=run, daemon=True).start()
 
     def _dig_done(self, design, pw):
-        pw.destroy(); self.design = design
+        pw.destroy()
+        self.design = design
         self.canvas.fit_design()
         self._refresh(); self._update_stats(); self._update_thread_panel()
-        self.root.title(f"{APP_NAME} -- {design.name}")
-        messagebox.showinfo("Done",
-            f"Digitized!\nStitches: {design.stitch_count:,}\n"
-            f"Colours: {design.color_count}\n"
-            f"Size: {design.width_mm:.1f}x{design.height_mm:.1f}mm")
+        self.root.title(f"{APP_NAME} — {design.name} (digitized)")
+        self.status_var.set(
+            f"Digitized ✨  ·  {design.stitch_count:,} stitches  ·  "
+            f"{design.color_count} colours  ·  "
+            f"{design.width_mm:.1f}×{design.height_mm:.1f} mm")
+        messagebox.showinfo("Done!",
+            f"Digitizing complete! ✨\n\n"
+            f"Stitches : {design.stitch_count:,}\n"
+            f"Colours  : {design.color_count}\n"
+            f"Size     : {design.width_mm:.1f} × {design.height_mm:.1f} mm")
 
     def _dig_fail(self, err, pw):
-        pw.destroy(); messagebox.showerror("Error", err)
+        pw.destroy(); messagebox.showerror("Digitize error", err)
+
+    # ── splitting ─────────────────────────────────────────────────────────
 
     def _open_split(self):
         if not self.design.threads:
-            messagebox.showwarning("No design","Open a design first."); return
+            messagebox.showwarning("No design","Open or digitize a design first."); return
         SplitDialog(self.root, self.design, self._do_split)
 
     def _do_split(self, direction, pct):
@@ -1564,36 +1848,49 @@ class App:
         if direction == "by_color":
             parts = DesignSplitter.split_by_color(self.design)
         elif direction == "horizontal":
-            parts = list(DesignSplitter.split_horizontal(self.design, b[1]+(b[3]-b[1])*pct))
+            y = b[1]+(b[3]-b[1])*pct
+            parts = list(DesignSplitter.split_horizontal(self.design,y))
         else:
-            parts = list(DesignSplitter.split_vertical(self.design, b[0]+(b[2]-b[0])*pct))
+            x = b[0]+(b[2]-b[0])*pct
+            parts = list(DesignSplitter.split_vertical(self.design,x))
         self._offer_save_parts(parts)
 
     def apply_canvas_split(self, is_h, cx, cy):
         if not self.design.threads: return
-        dx, dy = self.canvas.c2d(cx, cy)
-        parts = list(DesignSplitter.split_horizontal(self.design, dy) if is_h
-                     else DesignSplitter.split_vertical(self.design, dx))
+        dx,dy = self.canvas.c2d(cx,cy)
+        if is_h:
+            parts = list(DesignSplitter.split_horizontal(self.design,dy))
+        else:
+            parts = list(DesignSplitter.split_vertical(self.design,dx))
         self._offer_save_parts(parts)
 
     def _offer_save_parts(self, parts):
         parts = [p for p in parts if p.threads]
-        if not parts: messagebox.showwarning("Empty","No stitches in result."); return
+        if not parts:
+            messagebox.showwarning("Empty split","No stitches in split result."); return
         msg = (f"Split into {len(parts)} part(s).\n\n" +
-               "\n".join(f"  Part {i+1}: {p.name}  ({p.stitch_count:,} stitches)"
-                         for i,p in enumerate(parts)) + "\n\nSave each part now?")
-        if messagebox.askyesno("Split complete", msg):
+               "\n".join(f"  Part {i+1}: {p.name}  "
+                         f"({p.stitch_count:,} stitches, {p.color_count} colours)"
+                         for i,p in enumerate(parts)) +
+               "\n\nSave each part now?")
+        if messagebox.askyesno("Split complete 🎉", msg):
             for i, part in enumerate(parts):
                 p = filedialog.asksaveasfilename(
-                    title=f"Save part {i+1}: {part.name}",
-                    defaultextension=".pes", initialfile=part.name+".pes",
+                    title=f"Save part {i+1}/{len(parts)}: {part.name}",
+                    defaultextension=".pes",
+                    initialfile=part.name+".pes",
                     filetypes=WRITE_FORMATS)
                 if p:
-                    try: FileIO.save(part, p); self.status_var.set(f"Saved: {p}")
-                    except Exception as e: messagebox.showerror("Save error", str(e))
+                    try:
+                        FileIO.save(part,p)
+                        self.status_var.set(f"Saved: {p}")
+                    except Exception as e:
+                        messagebox.showerror("Save error",str(e))
         self.design = parts[0]
         self.canvas.fit_design()
         self._refresh(); self._update_stats(); self._update_thread_panel()
+
+    # ── canvas ────────────────────────────────────────────────────────────
 
     def _refresh(self):
         hoop = HOOP_SIZES.get(self.hoop_var.get())
@@ -1602,6 +1899,8 @@ class App:
     def fit_to_window(self):
         self.canvas.fit_design(); self._refresh()
 
+    # ── panels ────────────────────────────────────────────────────────────
+
     def _update_stats(self):
         d = self.design
         self.stat_vars["Stitches"].set(f"{d.stitch_count:,}")
@@ -1609,17 +1908,42 @@ class App:
         self.stat_vars["Width mm"].set(f"{d.width_mm:.1f}")
         self.stat_vars["Height mm"].set(f"{d.height_mm:.1f}")
 
+    def _change_thread_color(self, thread):
+        """Open color picker and apply new color to the thread."""
+        from tkinter import colorchooser
+        result = colorchooser.askcolor(
+            color=thread.color,
+            title=f"Pick color for {thread.name}",
+            parent=self.root
+        )
+        if result and result[1]:
+            thread.color = result[1].upper()
+            self._update_thread_panel()
+            self._refresh()
+
     def _update_thread_panel(self):
         for w in self.thread_frame.winfo_children(): w.destroy()
         for i, th in enumerate(self.design.threads):
-            row = tk.Frame(self.thread_frame, bg=LB_PINK); row.pack(fill="x", pady=2)
-            tk.Label(row, bg=th.color, width=2, relief="solid").pack(side="left",padx=4)
+            row = tk.Frame(self.thread_frame, bg=LB_PINK)
+            row.pack(fill="x", pady=2)
+
+            # Clickable color swatch — opens color picker
+            swatch = tk.Button(
+                row, bg=th.color, width=2, relief="solid",
+                cursor="hand2", bd=1,
+                activebackground=th.color,
+                command=lambda t=th: self._change_thread_color(t)
+            )
+            swatch.pack(side="left", padx=4, ipady=4)
+            swatch.bind("<Enter>", lambda e, b=swatch: b.config(relief="raised"))
+            swatch.bind("<Leave>", lambda e, b=swatch: b.config(relief="solid"))
+
             n_s = sum(1 for _,_,t in th.stitches if t==STITCH)
-            tk.Label(row, text=f"{i+1}. {th.name}", bg=LB_PINK,
-                     font=("Arial",9), anchor="w", fg=LB_DARK).pack(side="left")
+            tk.Label(row, text=f"{i+1}. {th.name}",
+                     bg=LB_PINK, font=("Arial",9), anchor="w",
+                     fg=LB_DARK).pack(side="left")
             tk.Label(row, text=f"({n_s:,})", bg=LB_PINK, fg="#B08080",
                      font=("Arial",8)).pack(side="right", padx=3)
-
     def _center_window(self):
         self.root.update_idletasks()
         sw,sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -1627,26 +1951,40 @@ class App:
 
     def _about(self):
         messagebox.showinfo(f"About {APP_NAME}",
-            f"{APP_NAME}\n{APP_SUB}  v{VERSION}\n\n"
-            "BX font library, text tool, image digitising,\n"
-            "design splitting, multi-format export.\n\n"
-            "Powered by pyembroidery, Pillow, OpenCV, NumPy")
+            f"🐞  {APP_NAME}\n{APP_SUB}  v{VERSION}\n\n"
+            "Features\n"
+            "  • BX font library (Embrilliance-compatible)\n"
+            "  • Text tool — type with your fonts\n"
+            "  • Image digitising (PNG/JPG → stitches)\n"
+            "  • Design splitting (multi-hoop)\n"
+            "  • Export: PES · DST · JEF · EXP · VP3 …\n"
+            "  • Stitch preview with zoom & pan\n\n"
+            "Powered by pyembroidery · Pillow · OpenCV · NumPy")
 
 
-
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Entry point
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     root = tk.Tk()
-    root.title(f"{APP_NAME} -- {APP_SUB}")
-    icon_path = Path(__file__).parent / "ladybug.ico"
+    root.title(f"{APP_NAME} — {APP_SUB}")
+
     try:
-        root.iconbitmap(str(icon_path))
+        icon = Image.new("RGBA",(48,48),(0,0,0,0))
+        d    = ImageDraw.Draw(icon)
+        d.ellipse([2,2,46,46],  fill="#C0392B")
+        d.ellipse([2,2,24,46],  fill="#96281B")
+        d.ellipse([18,0,30,12], fill="#3D1A1A")
+        for dx,dy in [(-12,-6),(4,-12),(14,0),(-12,8),(5,10)]:
+            d.ellipse([24+dx-4,24+dy-4,24+dx+4,24+dy+4], fill="#3D1A1A")
+        root.iconphoto(True, ImageTk.PhotoImage(icon))
     except Exception:
         pass
+
     App(root)
     root.mainloop()
 
 
 if __name__ == "__main__":
     main()
-
