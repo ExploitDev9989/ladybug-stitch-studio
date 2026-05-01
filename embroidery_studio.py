@@ -386,7 +386,16 @@ class BXFont:
 
         size = len(data)
         # Collect all #PES start positions
+        # BX001 may embed bare PEC blocks (no #PES wrapper) or full PES.
+        # Try both signatures.
         pes_pos = [m.start() for m in _re.finditer(b'#PES', data)]
+
+        # PEC block signature – the stitch payload inside PES files (ÿþ)
+        if not pes_pos:
+            pec_pos = [m.start() for m in _re.finditer(b'\xff\xfe', data)]
+            if pec_pos:
+                pes_pos = pec_pos   # treat as pseudo-PES positions
+
         if not pes_pos:
             return
 
@@ -1113,6 +1122,7 @@ class FontBrowserDialog(tk.Toplevel):
         self._size_var  = tk.DoubleVar(value=settings.get("text_size_mm", 25.4))
         self._spacing_v = tk.DoubleVar(value=settings.get("text_spacing",  1.2))
         self._preview_img = None
+        self._all_names   = []        # guard: set before trace fires
 
         self._build()
         self._populate_fonts()
@@ -1225,6 +1235,12 @@ class FontBrowserDialog(tk.Toplevel):
         if self._all_names:
             self._font_lb.selection_set(0)
             self._on_select()
+        else:
+            self._info_var.set(
+                "No fonts loaded.  Make sure your font folder contains .bx files\n"
+                "or subfolders with PES/DST files (A.pes, B.pes …).\n"
+                "Click '⟳ Reload Fonts' after checking the folder in Settings."
+            )
 
     def _filter_fonts(self):
         q = self._search.get().lower().strip()
